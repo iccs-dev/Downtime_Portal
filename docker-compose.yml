@@ -12,6 +12,7 @@ services:
   # stack from starting rather than being hidden.
   # ============================================================
   init:
+    build: .
     image: downtime_portal:latest
     container_name: django_init_down
 
@@ -40,8 +41,10 @@ services:
 
   # ============================================================
   # Django Web Application
-  # The only service with a build section: every app service runs
-  # this same image, so it is built once rather than once each.
+  # Every app service runs this same image. Each declares the same
+  # build section, so Compose builds it locally instead of trying to
+  # pull it from a registry; the shared build cache keeps the extra
+  # builds near-instant.
   # ============================================================
   web:
     build: .
@@ -87,6 +90,7 @@ services:
   # Celery Worker
   # ============================================================
   celery:
+    build: .
     image: downtime_portal:latest
     container_name: celery_worker_down
 
@@ -121,6 +125,7 @@ services:
   # would fire every schedule twice.
   # ============================================================
   beat:
+    build: .
     image: downtime_portal:latest
     container_name: celery_beat_down
 
@@ -201,6 +206,7 @@ services:
   # HRMS Watchdog
   # ============================================================
   hrms_watcher:
+    build: .
     image: downtime_portal:latest
     container_name: hrms_watcher_down
 
