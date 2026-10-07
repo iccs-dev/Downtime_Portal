@@ -420,8 +420,8 @@ def home(request):
                                 subject='Downtime Uploaded Successfully',
                                 body=summary_html,
                                 from_email=settings.DEFAULT_FROM_EMAIL,
-                                # to=['rahul.kumar@iccs.in', 'mis.support@iccs.in', 'mangesh.bhayje@iccs.in','santosh.kumar@iccs.in','akshat.bhatnagar@iccs.in'],
-                                 to=['sourabh.kumar@iccs.in'],
+                                to=['rahul.kumar@iccs.in', 'mis.support@iccs.in', 'mangesh.bhayje@iccs.in','santosh.kumar@iccs.in','akshat.bhatnagar@iccs.in'],
+                                # to=['sourabh.kumar@iccs.in'],
                             )
                             email.content_subtype = 'html'  # Set the email content to HTML
 
