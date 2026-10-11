@@ -567,6 +567,11 @@ ALLOWED_PROCESSES = (
     'RBI Chandigarh',
     'CESC Kolkata',
     'CESC Rajasthan',
+    'RBI KOCHI',
+    'RBI Bhubaneswar',
+    'Bajaj Allianz-Pune',
+    'NetMeds',
+    'Tamil Nadu CM Helpline',
 )
 
 _ALLOWED_PROCESS_KEYS = frozenset(_norm_value(name) for name in ALLOWED_PROCESSES)
