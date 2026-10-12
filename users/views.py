@@ -43,7 +43,7 @@ INACTIVE_ATS_SESSION_KEY = 'inactive_ats_error'
 
 # Upload validation limits.
 MAX_UPLOAD_ROWS = 300  # rows per file, excluding the header
-MAX_RECORD_AGE_DAYS = 40  # a date this old, or older, is rejected
+MAX_RECORD_AGE_DAYS = 45  # a date this old, or older, is rejected
 
 # Destination for approved files. Credentials come from the environment (.env);
 # never hard-code them here.
