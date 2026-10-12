@@ -1430,20 +1430,20 @@ class UploadValidationTests(DowntimeWorkflowTestCase):
             "a rejected upload must not create any database row",
         )
 
-   # --- Rule 1: 35 days old or older is rejected -------------------------
+   # --- Rule 1: 45 days old or older is rejected -------------------------
 
-    def test_file_exactly_35_days_old_is_rejected(self):
-        response = self.post_df(self.rows(2, days_old=35))
-        self.assert_rejected(response, "older than 35 days")
-
-
-    def test_file_older_than_35_days_is_rejected(self):
+    def test_file_exactly_45_days_old_is_rejected(self):
         response = self.post_df(self.rows(2, days_old=45))
-        self.assert_rejected(response, "older than 35 days")
+        self.assert_rejected(response, "older than 45 days")
 
 
-    def test_file_34_days_old_is_accepted(self):
-        response = self.post_df(self.rows(2, days_old=34))
+    def test_file_older_than_45_days_is_rejected(self):
+        response = self.post_df(self.rows(2, days_old=55))
+        self.assert_rejected(response, "older than 45 days")
+
+
+    def test_file_44_days_old_is_accepted(self):
+        response = self.post_df(self.rows(2, days_old=44))
         text = " ".join(b for _, b in self.messages_of(response))
         self.assertIn("sent for approval", text)
         self.assertEqual(
