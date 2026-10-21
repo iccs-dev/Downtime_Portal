@@ -9,7 +9,7 @@ from django.conf import settings
 import pandas as pd
 import time 
 from django.core.mail import EmailMultiAlternatives, send_mail
-from users.models import UploadedFile  # Import your model
+from users.models import UploadedFile, User  # Import your model
 from django.utils.timezone import now
 import logging
 import re
@@ -20,6 +20,7 @@ from django.utils.html import escape
 from django.utils.timezone import localtime
 from pytz import timezone as _timezone
 
+from users import mapping
 from users.utils import clean_hrms_dump_and_update_mapping
 
 ist = _timezone("Asia/Kolkata")
@@ -128,25 +129,68 @@ def notify_l1_pending_files():
     )
 
 
+def cluster_head_email(ats_id):
+    """Email of the active L2 account `ats_id`, or None when there is none."""
+    if not ats_id:
+        return None
+    head = User.objects.filter(
+        username__iexact=ats_id, role='l2', is_active=True
+    ).first()
+    return (head.email or None) if head else None
+
+
 @shared_task
 def notify_l2_pending_files():
-    """Files L1 has unlocked that are still waiting on an L2 decision."""
-    pending = UploadedFile.objects.filter(**_PENDING_BASE, l1_status='unlock')
-    rows = _pending_rows(pending)
+    """Files L1 has unlocked that are still waiting on an L2 decision.
 
-    if not rows:
+    Each Cluster Head is mailed only their own processes' files, at the email on
+    their user account. A file with no reachable Cluster Head - its process has
+    none, or that Cluster Head has no active L2 account with an email - goes to
+    L2_PENDING_NOTIFY_EMAIL instead, so nothing pending goes unreported.
+    """
+    pending = UploadedFile.objects.filter(**_PENDING_BASE, l1_status='unlock')
+
+    if not pending.exists():
         hrms_logger.info("No files pending L2 approval; no mail sent.")
         return "Nothing pending for L2."
 
-    return _send_pending_reminder(
-        subject="Pending Files - Approval Required",
-        intro=(
-            "This is a reminder that the following files are pending for "
-            "approval. Please review and approve the pending files."
-        ),
-        recipient=settings.L2_PENDING_NOTIFY_EMAIL,
-        rows=rows,
+    subject = "Pending Files - Approval Required"
+    intro = (
+        "This is a reminder that the following files are pending for "
+        "approval. Please review and approve the pending files."
     )
+
+    # Group the pending files by the address that should hear about them.
+    by_recipient = {}
+    for record in pending:
+        ats_id = mapping.cluster_head_for(record.process, record.location)
+        email = cluster_head_email(ats_id)
+        if not email:
+            if ats_id:
+                hrms_logger.warning(
+                    "Cluster Head %s has no active L2 account with an email; "
+                    "'%s' is reported to the fallback address.",
+                    ats_id, record.file.name,
+                )
+            email = settings.L2_PENDING_NOTIFY_EMAIL
+        by_recipient.setdefault(email, []).append(record.id)
+
+    # One failing mail must not stop the others.
+    results = []
+    for email in sorted(by_recipient, key=lambda e: (e or '').lower()):
+        rows = _pending_rows(pending.filter(id__in=by_recipient[email]))
+        try:
+            results.append(_send_pending_reminder(
+                subject=subject, intro=intro, recipient=email, rows=rows,
+            ))
+        except Exception as exc:
+            hrms_logger.error(
+                "Could not send the L2 reminder to %s: %s",
+                email, exc, exc_info=True,
+            )
+            results.append("Failed %s: %s" % (email, exc))
+
+    return "; ".join(results)
 
 
 # --------------------------------------------------------------------------

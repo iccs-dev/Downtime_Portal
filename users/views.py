@@ -4,7 +4,7 @@ from django.contrib.auth import authenticate, login, logout
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from .forms import CSVUploadForm
-from .models import StoredFile, UploadedFile, User
+from .models import StoredFile, UploadedFile, UploadSettings, User
 from django.core.files.storage import FileSystemStorage
 from django.http import HttpResponse
 from django.utils.encoding import smart_str
@@ -19,7 +19,7 @@ from io import BytesIO
 
 import pandas as pd
 from django.utils.timezone import now
-from django.utils.timezone import now, localtime 
+from django.utils.timezone import now, localdate, localtime
 from pytz import timezone
 import subprocess
 import shutil
@@ -29,7 +29,9 @@ import uuid  # Add at the top if not already imported
 from django.core.mail import EmailMessage
 from datetime import datetime, timedelta
 import re
-from users.tasks import _notify_hrms_outcome, _record_delivery_failure, upload_to_hrms
+from users.tasks import (
+    _notify_hrms_outcome, _record_delivery_failure, cluster_head_email, upload_to_hrms,
+)
 from users import mapping
 
 ist = timezone("Asia/Kolkata")
@@ -43,7 +45,8 @@ INACTIVE_ATS_SESSION_KEY = 'inactive_ats_error'
 
 # Upload validation limits.
 MAX_UPLOAD_ROWS = 300  # rows per file, excluding the header
-MAX_RECORD_AGE_DAYS = 45  # a date this old, or older, is rejected
+# How many days back a file may be dated is an admin setting (UploadSettings),
+# read on every upload so a change applies without a restart.
 
 # Destination for approved files. Credentials come from the environment (.env);
 # never hard-code them here.
@@ -163,20 +166,22 @@ def validate_file_format(uploaded_file):
                 if not is_valid_date_format(d):
                     return False, f"Invalid date format. Allowed formats: mm-dd-yyyy."
 
-            # Parse strings to datetime
-            parsed_dates = date_strings.apply(lambda d: datetime.strptime(d, "%m-%d-%Y"))
-
-            # Compare against midnight today. Parsed dates carry no time, so using
-            # the current time of day here would make the boundary drift.
-            today = datetime.today().replace(
-                hour=0, minute=0, second=0, microsecond=0
+            # Parse strings to dates; they carry no time of day.
+            parsed_dates = date_strings.apply(
+                lambda d: datetime.strptime(d, "%m-%d-%Y").date()
             )
-            oldest_allowed = today - timedelta(days=MAX_RECORD_AGE_DAYS)
 
-            # A date exactly MAX_RECORD_AGE_DAYS old is already too old, hence <=.
+            # Today in India time (settings.TIME_ZONE), not the server clock, so
+            # a server running in UTC does not treat today's rows as future
+            # dates between midnight and 05:30 IST.
+            today = localdate()
+            allowed_days = UploadSettings.allowed_days()
+            oldest_allowed = today - timedelta(days=allowed_days)
+
+            # A date exactly allowed_days old is already too old, hence <=.
             if (parsed_dates <= oldest_allowed).any():
                 return False, (
-                    f"File contains Date older than {MAX_RECORD_AGE_DAYS} days."
+                    f"File contains Date older than {allowed_days} days."
                 )
 
             if (parsed_dates > today).any():
@@ -420,7 +425,9 @@ def home(request):
                                 subject='Downtime Uploaded Successfully',
                                 body=summary_html,
                                 from_email=settings.DEFAULT_FROM_EMAIL,
-                                to=['rahul.kumar@iccs.in', 'mis.support@iccs.in', 'mangesh.bhayje@iccs.in','santosh.kumar@iccs.in','akshat.bhatnagar@iccs.in'],
+                                to=upload_notification_recipients(
+                                    selected_process, selected_location
+                                ),
                                 # to=['sourabh.kumar@iccs.in'],
                             )
                             email.content_subtype = 'html'  # Set the email content to HTML
@@ -478,7 +485,7 @@ def home(request):
         # enforced rather than a number copied into the template.
         'process_count': len(mapping.get_processes()),
         'max_upload_rows': MAX_UPLOAD_ROWS,
-        'max_record_age_days': MAX_RECORD_AGE_DAYS,
+        'max_record_age_days': UploadSettings.allowed_days(),
         "MEDIA_URL": settings.MEDIA_URL
     })
 
@@ -594,6 +601,22 @@ def _approval_failed(file, file_name, l2_user, hrms_status, error):
     )
 
 
+# Always told about an upload, whatever the process.
+UPLOAD_NOTIFY_EMAILS = [
+    'rahul.kumar@iccs.in', 'mis.support@iccs.in', 'mangesh.bhayje@iccs.in',
+    'santosh.kumar@iccs.in',
+]
+# The single L2 address used before per-process Cluster Heads. Still mailed when
+# a process has no Cluster Head with an email, so no upload goes unannounced.
+UPLOAD_NOTIFY_FALLBACK_L2 = 'akshat.bhatnagar@iccs.in'
+
+
+def upload_notification_recipients(process, location=None):
+    """Upload mail recipients: the fixed list plus the process's Cluster Head."""
+    l2_email = cluster_head_email(mapping.cluster_head_for(process, location))
+    return UPLOAD_NOTIFY_EMAILS + [l2_email or UPLOAD_NOTIFY_FALLBACK_L2]
+
+
 # ---------- FILE APPROVAL PAGE (L2 Users) ----------
 @login_required
 def approve_files_l2(request):
@@ -612,6 +635,11 @@ def approve_files_l2(request):
         approved_by_l2=False,
         rejected_by_l2=False,
     )
+    # A Cluster Head sees only the processes assigned to them; any other L2
+    # user keeps the shared view of everything.
+    scope = mapping.l2_queue_filter(request.user.username)
+    if scope is not None:
+        pending = pending.filter(scope)
     files = pending.filter(l1_status='unlock')
     # A file HRMS sent back as "already processed" is L1's to re-mark; it is
     # kept off L2 entirely until L1 unlocks it again.
@@ -652,10 +680,15 @@ def approve_files_l2(request):
                     )
                     return redirect('approve_files_l2')
 
-                claimed = UploadedFile.objects.filter(
+                claimable = UploadedFile.objects.filter(
                     id=file.id, l1_status='unlock',
                     approved_by_l2=False, rejected_by_l2=False
-                ).update(
+                )
+                # Also part of the claim: a Cluster Head cannot act on another
+                # Cluster Head's file by posting its id directly.
+                if scope is not None:
+                    claimable = claimable.filter(scope)
+                claimed = claimable.update(
                     approved_by_l2=True,
                     approved_by_l2_user=request.user,
                     approved_at_l2=now(),
@@ -718,10 +751,13 @@ def approve_files_l2(request):
             else:
                 try:
                     file = UploadedFile.objects.get(id=file_id)
-                    claimed = UploadedFile.objects.filter(
+                    claimable = UploadedFile.objects.filter(
                         id=file.id, l1_status='unlock',
                         approved_by_l2=False, rejected_by_l2=False
-                    ).update(
+                    )
+                    if scope is not None:
+                        claimable = claimable.filter(scope)
+                    claimed = claimable.update(
                         rejected_by_l2=True,
                         rejected_by_l2_user=request.user,
                         rejected_at_l2=now(),
