@@ -3,7 +3,7 @@ from django import forms
 import os
 from django.contrib.auth import get_user_model
 
-from .mapping import get_locations, get_processes, locations_for_process
+from .mapping import allowed_locations_for_process, get_locations, get_processes
 
 User = get_user_model()
 class CSVUploadForm(forms.Form):
@@ -69,9 +69,11 @@ class CSVUploadForm(forms.Form):
         # posted pair that was never offered is rejected on the server too.
         process = cleaned_data.get('process')
         location = cleaned_data.get('location')
+        # Only the locations both the mapping file and an active Process row
+        # allow; a process taken off a site in the admin is refused there too.
         if process and location:
-            allowed = locations_for_process(process)
-            if allowed and location not in allowed:
+            allowed = allowed_locations_for_process(process)
+            if location not in allowed:
                 self.add_error(
                     'location',
                     "'%s' is not a valid Location for the Process '%s'. "

@@ -1,4 +1,6 @@
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+from django.db.models.functions import Lower
 from django.contrib.auth.models import AbstractUser
 from django.conf import settings
 
@@ -152,3 +154,99 @@ class DailySummary(models.Model):
     def __str__(self):
         return f"{self.date} - {self.process}"
 
+
+
+class Process(models.Model):
+    """A process offered on the upload page, and who approves it at L2.
+
+    Managed from the admin site. The name and location are picked from the HRMS
+    mapping file, which is still what ties each ATS ID to a process; a row here
+    only decides whether that process/location may be uploaded against and which
+    Cluster Head receives its files after L1.
+
+    Deactivating a row only takes it off the upload dropdown. Files keep the
+    process name as text, so nothing already uploaded is touched, and files
+    still pending keep routing to the Cluster Head named here.
+    """
+    name = models.CharField('Process Name', max_length=150)
+    location = models.CharField(max_length=100)
+    cluster_head_name = models.CharField('Cluster Head Name', max_length=150)
+    cluster_head_ats_id = models.CharField('Cluster Head ATS ID', max_length=20)
+    is_active = models.BooleanField(
+        'Active', default=True,
+        help_text='Untick to remove it from the upload Process dropdown. '
+                  'Uploaded files and their history are not affected.',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Process'
+        verbose_name_plural = 'Processes'
+        ordering = ['name', 'location']
+        constraints = [
+            models.UniqueConstraint(
+                Lower('name'), Lower('location'),
+                name='unique_process_location_ci',
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        self.name = ' '.join(self.name.split())
+        self.location = ' '.join(self.location.split())
+        self.cluster_head_name = ' '.join(self.cluster_head_name.split())
+        self.cluster_head_ats_id = self.cluster_head_ats_id.strip().upper()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.name} ({self.location})"
+
+
+class UploadSettings(models.Model):
+    """Upload rules an admin can change without a code change or restart.
+
+    A single row (pk=1), edited from the admin site. It is read on every upload
+    request, so a saved change applies to the very next upload.
+    """
+    DEFAULT_ALLOWED_UPLOAD_DAYS = 45
+    MIN_ALLOWED_UPLOAD_DAYS = 1
+    MAX_ALLOWED_UPLOAD_DAYS = 365
+
+    allowed_upload_days = models.PositiveSmallIntegerField(
+        'Allowed File Upload Days',
+        default=DEFAULT_ALLOWED_UPLOAD_DAYS,
+        validators=[
+            MinValueValidator(MIN_ALLOWED_UPLOAD_DAYS),
+            MaxValueValidator(MAX_ALLOWED_UPLOAD_DAYS),
+        ],
+        help_text=(
+            'How many days a file may cover, counting today (India time). '
+            'For example 3 accepts today and the 2 days before; a date that '
+            'many days old or older, or any future date, is rejected. '
+            'Whole number from 1 to 365.'
+        ),
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='+',
+    )
+
+    class Meta:
+        verbose_name = 'Upload Settings'
+        verbose_name_plural = 'Upload Settings'
+
+    def save(self, *args, **kwargs):
+        self.pk = 1  # only ever one row
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def allowed_days(cls):
+        """The configured window, or the default when the row is missing."""
+        value = cls.objects.filter(pk=1).values_list(
+            'allowed_upload_days', flat=True
+        ).first()
+        return value or cls.DEFAULT_ALLOWED_UPLOAD_DAYS
+
+    def __str__(self):
+        return 'Upload Settings'

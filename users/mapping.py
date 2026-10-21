@@ -359,6 +359,7 @@ import threading
 
 import pandas as pd
 from django.conf import settings
+from django.db.models import Q
 
 logger = logging.getLogger(__name__)
 
@@ -547,51 +548,124 @@ def get_mapping(force_reload=False):
         return _cache
 
 
-# Only these processes may be uploaded against. Everything else in
-# mapping.xlsx stays in the index - so ATS IDs still resolve and existing files
-# keep validating - but is not offered on the upload page.
+# ---------------------------------------------------------------------------
+# Processes offered for upload, and their Cluster Heads
+# ---------------------------------------------------------------------------
+# Both come from the Process table, managed from the admin site. The mapping
+# file is still what ties each ATS ID to a process and location; a Process row
+# only decides whether that process/location is offered on the upload page and
+# which Cluster Head (an L2 user whose username is the ATS ID) approves it.
 #
-# Matched case- and space-insensitively against the mapping's own spelling, so
-# "Emaar" here finds "EMAAR" in the file. A name that is not in the mapping on a
-# given day simply does not appear, and starts appearing by itself once the
-# daily HRMS dump carries it.
-ALLOWED_PROCESSES = (
-    'Think Gas',
-    'JVVNL',
-    'TPDDL',
-    'UGVCL',
-    'Jindal Steel LTD',
-    'E-Saras',
-    'Emaar',
-    'DIC',
-    'RBI Chandigarh',
-    'CESC Kolkata',
-    'CESC Rajasthan',
-    'RBI KOCHI',
-    'RBI Bhubaneswar',
-    'Bajaj Allianz-Pune',
-    'NetMeds',
-    'Tamil Nadu CM Helpline',
-)
+# Names are matched case- and space-insensitively against the mapping's own
+# spelling. Routing reads every row, active or not, so files still pending
+# under a process that has been taken off the dropdown keep reaching their
+# Cluster Head. An L2 user who is no row's Cluster Head keeps the original view
+# of every pending file, as does any file with no Cluster Head - so nothing can
+# fall out of the L2 queue unseen.
 
-_ALLOWED_PROCESS_KEYS = frozenset(_norm_value(name) for name in ALLOWED_PROCESSES)
+def _process_rows(active_only=False):
+    """[(name, location, cluster head ATS ID)] from the Process table."""
+    from users.models import Process  # here, not at import: models import late
+
+    rows = Process.objects.all()
+    if active_only:
+        rows = rows.filter(is_active=True)
+    return list(rows.values_list('name', 'location', 'cluster_head_ats_id'))
+
+
+def _norm_username(username):
+    return str(username or '').strip().upper()
 
 
 def is_allowed_process(name):
     """True when a process may be chosen on the upload page."""
-    return _norm_value(name) in _ALLOWED_PROCESS_KEYS
+    wanted = _norm_value(name or '')
+    return any(_norm_value(row[0]) == wanted for row in _process_rows(active_only=True))
+
+
+def _heads_by_process(rows):
+    """{process: {location: ATS ID}}, all keys normalised."""
+    heads = {}
+    for name, location, ats_id in rows:
+        heads.setdefault(_norm_value(name), {})[_norm_value(location)] = (
+            _norm_username(ats_id)
+        )
+    return heads
+
+
+def cluster_head_for(process, location=None):
+    """ATS ID of the Cluster Head for `process` at `location`, or None.
+
+    Without an exact process/location row - a file uploaded before locations
+    were recorded, say - the process's Cluster Head is still known when every
+    location of that process has the same one.
+    """
+    by_location = _heads_by_process(_process_rows()).get(_norm_value(process or ''))
+    if not by_location:
+        return None
+    if location and _norm_value(location) in by_location:
+        return by_location[_norm_value(location)]
+    heads = set(by_location.values())
+    return heads.pop() if len(heads) == 1 else None
+
+
+def is_cluster_head(username):
+    """True when `username` is the Cluster Head of at least one process."""
+    wanted = _norm_username(username)
+    return any(_norm_username(row[2]) == wanted for row in _process_rows())
+
+
+def l2_queue_filter(username):
+    """Q restricting UploadedFile rows to what `username` handles at L2.
+
+    None for an L2 user who is not a Cluster Head, meaning no restriction.
+    Mirrors cluster_head_for: a process whose locations all share this Cluster
+    Head is matched on its name alone, otherwise on process and location.
+    """
+    wanted = _norm_username(username)
+    rows = _process_rows()
+    query = None
+    for process_key, by_location in _heads_by_process(rows).items():
+        mine = [loc for loc, ats_id in by_location.items() if ats_id == wanted]
+        if not mine:
+            continue
+        name = next(r[0] for r in rows if _norm_value(r[0]) == process_key)
+        if set(by_location.values()) == {wanted}:
+            clause = Q(process__iexact=name)
+        else:
+            clause = Q()
+            for loc in mine:
+                original = next(
+                    r[1] for r in rows
+                    if _norm_value(r[0]) == process_key and _norm_value(r[1]) == loc
+                )
+                clause |= Q(process__iexact=name, location__iexact=original)
+        query = clause if query is None else query | clause
+    return query
 
 
 def get_processes():
     """Process names offered on the upload dropdown, blanks removed.
 
-    Restricted to ALLOWED_PROCESSES; the mapping's own spelling is what is
-    returned, so the value posted back matches the file exactly.
+    A process from the mapping file with an active Process row; the mapping's
+    own spelling is what is returned, so the value posted back matches the file
+    exactly.
     """
     try:
-        return [p for p in get_mapping()['processes'] if is_allowed_process(p)]
+        offered = get_mapping()['processes']
     except MappingUnavailable as exc:
         logger.error("Process dropdown could not be populated: %s", exc)
+        return []
+    active = {_norm_value(row[0]) for row in _process_rows(active_only=True)}
+    return [p for p in offered if _norm_value(p) in active]
+
+
+def get_mapping_processes():
+    """Every process in the mapping file, for picking one in the admin."""
+    try:
+        return list(get_mapping()['processes'])
+    except MappingUnavailable as exc:
+        logger.error("Mapping processes are unavailable: %s", exc)
         return []
 
 
@@ -619,22 +693,24 @@ def locations_for_process(process):
         return []
 
 
+def allowed_locations_for_process(process):
+    """Locations `process` may be uploaded for: in the mapping and active here."""
+    active = {
+        _norm_value(row[1]) for row in _process_rows(active_only=True)
+        if _norm_value(row[0]) == _norm_value(process or '')
+    }
+    return [loc for loc in locations_for_process(process) if _norm_value(loc) in active]
+
+
 def get_process_location_map():
-    """{process name: [locations]} for every process, for the upload page.
+    """{process name: [locations]} for every offered process, for the upload page.
 
     Keyed on the workbook's own spelling of the process so the value can be
     matched straight against the Process dropdown.
     """
-    try:
-        data = get_mapping()
-    except MappingUnavailable as exc:
-        logger.error("Process/Location map could not be built: %s", exc)
-        return {}
-
     return {
-        process: list(data['process_locations'].get(_norm_value(process), []))
-        for process in data['processes']
-        if is_allowed_process(process)
+        process: allowed_locations_for_process(process)
+        for process in get_processes()
     }
 
 

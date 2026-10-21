@@ -1211,9 +1211,9 @@ from django.core.mail.backends.base import BaseEmailBackend
 from django.conf import settings
 from django.template.loader import render_to_string
 from django.test import TestCase, override_settings
-from django.utils.timezone import now
+from django.utils.timezone import localdate, now
 
-from .models import StoredFile, UploadedFile, User
+from .models import Process, StoredFile, UploadedFile, UploadSettings, User
 from users import mapping as users_mapping
 
 # Captured at import time, before any patch replaces it, so a test can put the
@@ -1226,7 +1226,8 @@ XLSX_CONTENT_TYPE = (
 
 # The view accepts mm-dd-yyyy only, rejects future dates, and rejects anything
 # older than 41 days. Derive it from today so the fixture does not expire.
-RECENT_DATE = (datetime.today() - timedelta(days=1)).strftime("%m-%d-%Y")
+# India-time dates, matching how the upload check decides what "today" is.
+RECENT_DATE = (localdate() - timedelta(days=1)).strftime("%m-%d-%Y")
 
 TEMP_MEDIA_ROOT = tempfile.mkdtemp(prefix="downtime-test-media-")
 
@@ -1355,7 +1356,7 @@ class DowntimeWorkflowTestCase(TestCase):
 
     @staticmethod
     def rows(count, days_old=1):
-        date = (datetime.today() - timedelta(days=days_old)).strftime("%m-%d-%Y")
+        date = (localdate() - timedelta(days=days_old)).strftime("%m-%d-%Y")
         return pd.DataFrame(
             {
                 "EmpCode": [f"ATS{i:06d}" for i in range(1, count + 1)],
@@ -1470,6 +1471,137 @@ class UploadValidationTests(DowntimeWorkflowTestCase):
         response = self.post_df(self.rows(2, days_old=0))
         text = " ".join(b for _, b in self.messages_of(response))
         self.assertIn("sent for approval", text)
+
+
+
+class AllowedUploadDaysTests(DowntimeWorkflowTestCase):
+    """The upload window comes from Upload Settings and applies at once."""
+
+    assert_rejected = UploadValidationTests.assert_rejected
+
+    def set_days(self, days):
+        UploadSettings.objects.update_or_create(
+            pk=1, defaults={"allowed_upload_days": days}
+        )
+
+    def assert_accepted(self, response):
+        text = " ".join(b for _, b in self.messages_of(response))
+        self.assertIn("sent for approval", text)
+
+    def test_the_seeded_window_is_45_days(self):
+        self.assertEqual(UploadSettings.allowed_days(), 45)
+
+    def test_boundaries_follow_the_configured_days(self):
+        self.set_days(3)
+        for days_old, accepted in ((0, True), (2, True), (3, False), (10, False)):
+            with self.subTest(days_old=days_old):
+                UploadedFile.objects.all().delete()
+                response = self.post_df(self.rows(2, days_old=days_old))
+                if accepted:
+                    self.assert_accepted(response)
+                else:
+                    self.assert_rejected(response, "older than 3 days")
+
+    def test_one_day_means_today_only(self):
+        self.set_days(1)
+        self.assert_accepted(self.post_df(self.rows(2, days_old=0)))
+        UploadedFile.objects.all().delete()
+        self.assert_rejected(self.post_df(self.rows(2, days_old=1)), "older than 1 days")
+
+    def test_future_dates_stay_rejected_with_a_wide_window(self):
+        self.set_days(365)
+        self.assert_rejected(self.post_df(self.rows(2, days_old=-1)), "Future Date")
+
+    def test_a_change_applies_to_the_next_upload_without_restart(self):
+        self.assert_accepted(self.post_df(self.rows(2, days_old=10)))
+        UploadedFile.objects.all().delete()
+
+        self.set_days(7)
+
+        self.assert_rejected(self.post_df(self.rows(2, days_old=10)), "older than 7 days")
+
+    def test_the_upload_page_shows_the_configured_days(self):
+        self.set_days(7)
+        self.client.force_login(self.uploader)
+        self.assertContains(self.client.get("/home/"), "dated within the last 7 days")
+
+    def test_a_missing_row_falls_back_to_45(self):
+        UploadSettings.objects.all().delete()
+        self.assertEqual(UploadSettings.allowed_days(), 45)
+
+    def test_today_is_india_time_not_utc(self):
+        """01:30 IST on 20 Oct is still 19 Oct in UTC; 20 Oct must count as today."""
+        from datetime import datetime as dt, timezone as tz
+
+        utc_now = dt(2026, 10, 19, 20, 0, tzinfo=tz.utc)  # 20-10-2026 01:30 IST
+        frame = pd.DataFrame({
+            "EmpCode": ["ATS000001", "ATS000002"],
+            "Date": ["10-20-2026", "10-20-2026"],
+            "Minutes": [30, 30],
+        })
+        with patch("django.utils.timezone.now", return_value=utc_now):
+            self.assert_accepted(self.post_df(frame))
+
+        UploadedFile.objects.all().delete()
+        frame["Date"] = ["10-21-2026", "10-21-2026"]
+        with patch("django.utils.timezone.now", return_value=utc_now):
+            self.assert_rejected(self.post_df(frame), "Future Date")
+
+
+class UploadSettingsAdminTests(DowntimeWorkflowTestCase):
+    """Admins set the window on one edit-only page; bad values are refused."""
+
+    URL = "/admin/users/uploadsettings/1/change/"
+
+    def setUp(self):
+        super().setUp()
+        self.superuser = User.objects.create_superuser(
+            username="root", password="pw", email="root@iccs.in",
+        )
+        self.client.force_login(self.superuser)
+
+    def test_saving_a_valid_value_applies_and_records_who(self):
+        response = self.client.post(self.URL, {"allowed_upload_days": "7"})
+        self.assertEqual(response.status_code, 302)
+        row = UploadSettings.objects.get(pk=1)
+        self.assertEqual(row.allowed_upload_days, 7)
+        self.assertEqual(row.updated_by, self.superuser)
+        self.assertEqual(UploadSettings.allowed_days(), 7)
+
+    def test_invalid_values_are_refused_with_a_message(self):
+        for value in ("0", "-3", "366", "abc", "", "2.5"):
+            with self.subTest(value=value):
+                response = self.client.post(self.URL, {"allowed_upload_days": value})
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.context["adminform"].form.errors)
+        self.assertEqual(UploadSettings.allowed_days(), 45)
+
+    def test_the_list_opens_the_single_row_and_add_delete_are_off(self):
+        response = self.client.get("/admin/users/uploadsettings/")
+        self.assertRedirects(response, self.URL)
+        self.assertEqual(self.client.get("/admin/users/uploadsettings/add/").status_code, 403)
+        self.assertEqual(
+            self.client.post("/admin/users/uploadsettings/1/delete/", {"post": "yes"}).status_code,
+            403,
+        )
+
+    def test_it_sits_below_processes_in_the_sidebar(self):
+        page = self.client.get("/admin/")
+        users_app = next(a for a in page.context["app_list"] if a["app_label"] == "users")
+        names = [m["object_name"] for m in users_app["models"]]
+        self.assertEqual(names[:3], ["User", "Process", "UploadSettings"])
+
+    def test_staff_need_the_permission(self):
+        from django.contrib.auth.models import Permission
+
+        staff = User.objects.create_user(username="staff", password="pw", is_staff=True)
+        self.client.force_login(staff)
+        self.assertEqual(self.client.get(self.URL).status_code, 403)
+
+        staff.user_permissions.add(*Permission.objects.filter(
+            codename__in=("view_uploadsettings", "change_uploadsettings")
+        ))
+        self.assertEqual(self.client.get(self.URL).status_code, 200)
 
 
 class L1QueueTests(DowntimeWorkflowTestCase):
@@ -2436,6 +2568,314 @@ class AllowedProcessTests(TestCase):
         self.assertGreater(len(mapping.get_locations()), 2)
 
 
+class ClusterHeadRoutingTests(DowntimeWorkflowTestCase):
+    """After L1 unlocks, a file goes to its process's Cluster Head at L2."""
+
+    def setUp(self):
+        super().setUp()
+        from users import mapping
+
+        owner_id = mapping.cluster_head_for(UPLOAD_PROCESS)
+        self.assertIsNotNone(owner_id, f"{UPLOAD_PROCESS!r} has no Cluster Head")
+        other_id = (
+            Process.objects.exclude(cluster_head_ats_id=owner_id)
+            .values_list("cluster_head_ats_id", flat=True).first()
+        )
+        self.owner = User.objects.create_user(
+            username=owner_id, password="pw", role="l2", email="owner@iccs.in",
+        )
+        self.other = User.objects.create_user(
+            username=other_id, password="pw", role="l2", email="other@iccs.in",
+        )
+
+        self.upload_as(self.uploader)
+        self.file = self.pending_file()
+        self.client.force_login(self.l1_a)
+        self.client.post("/approve/", {"file_id": self.file.id, "unlock_and_save": "1"})
+
+    def queue_of(self, user):
+        self.client.force_login(user)
+        response = self.client.get("/approve-l2/")
+        return (
+            [f.id for f in response.context["files"]],
+            [f.id for f in response.context["locked_files"]],
+        )
+
+    def test_only_the_processes_cluster_head_sees_the_file(self):
+        self.assertEqual(self.queue_of(self.owner), ([self.file.id], []))
+        self.assertEqual(self.queue_of(self.other), ([], []))
+
+    def test_an_l2_user_who_is_not_a_cluster_head_still_sees_everything(self):
+        self.assertEqual(self.queue_of(self.l2), ([self.file.id], []))
+
+    def test_a_locked_file_is_listed_for_its_cluster_head_only(self):
+        UploadedFile.objects.filter(id=self.file.id).update(l1_status="")
+        self.assertEqual(self.queue_of(self.owner), ([], [self.file.id]))
+        self.assertEqual(self.queue_of(self.other), ([], []))
+
+    def test_a_process_without_a_cluster_head_goes_to_the_shared_queue(self):
+        UploadedFile.objects.filter(id=self.file.id).update(process="No Such Process")
+        self.assertEqual(self.queue_of(self.owner), ([], []))
+        self.assertEqual(self.queue_of(self.l2), ([self.file.id], []))
+
+    @patch(SCP_TARGET)
+    def test_another_cluster_head_cannot_approve_by_posting_the_id(self, mock_scp):
+        self.client.force_login(self.other)
+        self.client.post("/approve-l2/", {"file_id": self.file.id, "approve": "1"})
+
+        self.file.refresh_from_db()
+        self.assertFalse(self.file.approved_by_l2)
+        mock_scp.assert_not_called()
+
+    def test_another_cluster_head_cannot_reject_by_posting_the_id(self):
+        self.client.force_login(self.other)
+        self.client.post("/approve-l2/", {
+            "file_id": self.file.id, "reject": "1", "rejection_reason": "no",
+        })
+
+        self.file.refresh_from_db()
+        self.assertFalse(self.file.rejected_by_l2)
+
+    @patch(SCP_TARGET)
+    def test_the_cluster_head_approves_as_before(self, mock_scp):
+        mock_scp.return_value = os.path.join(TEMP_MEDIA_ROOT, "L2_approved", "x.csv")
+        self.client.force_login(self.owner)
+        self.client.post("/approve-l2/", {"file_id": self.file.id, "approve": "1"})
+
+        self.file.refresh_from_db()
+        self.assertTrue(self.file.approved_by_l2)
+        self.assertEqual(self.file.approved_by_l2_user, self.owner)
+        mock_scp.assert_called_once()
+
+    def test_the_reminder_goes_only_to_the_cluster_head(self):
+        from users.tasks import notify_l2_pending_files
+        mail.outbox = []
+
+        notify_l2_pending_files()
+
+        self.assertEqual([m.to for m in mail.outbox], [["owner@iccs.in"]])
+        self.assertIn(os.path.basename(self.file.file.name), mail.outbox[0].body)
+
+    def test_the_reminder_falls_back_when_the_cluster_head_has_no_email(self):
+        from users.tasks import notify_l2_pending_files
+        User.objects.filter(id=self.owner.id).update(email="")
+        mail.outbox = []
+
+        notify_l2_pending_files()
+
+        self.assertEqual(
+            [m.to for m in mail.outbox], [[settings.L2_PENDING_NOTIFY_EMAIL]]
+        )
+
+    def test_each_cluster_head_gets_only_their_own_files(self):
+        from users import mapping
+        from users.tasks import notify_l2_pending_files
+        other_row = Process.objects.filter(
+            cluster_head_ats_id=self.other.username
+        ).first()
+        UploadedFile.objects.create(
+            file="L1_approved/other.xlsx", uploaded_by=self.uploader,
+            process=other_row.name, location=other_row.location,
+            is_split=True, l1_status="unlock",
+        )
+        mail.outbox = []
+
+        notify_l2_pending_files()
+
+        sent = {m.to[0]: m.body for m in mail.outbox}
+        self.assertEqual(sorted(sent), ["other@iccs.in", "owner@iccs.in"])
+        self.assertIn("other.xlsx", sent["other@iccs.in"])
+        self.assertNotIn("other.xlsx", sent["owner@iccs.in"])
+        self.assertIn(os.path.basename(self.file.file.name), sent["owner@iccs.in"])
+
+
+class ClusterHeadMappingTests(TestCase):
+    """The process -> Cluster Head list itself."""
+
+    def test_every_cluster_head_process_can_be_uploaded(self):
+        from users import mapping
+        for process in Process.objects.values_list("name", flat=True):
+            self.assertTrue(mapping.is_allowed_process(process), process)
+
+    def test_dic_and_bajaj_are_separate_allowed_processes(self):
+        from users import mapping
+        self.assertTrue(mapping.is_allowed_process("DIC"))
+        self.assertTrue(mapping.is_allowed_process("Bajaj Allianz-Pune"))
+
+    def test_lookup_ignores_case_and_spacing(self):
+        from users import mapping
+        self.assertEqual(mapping.cluster_head_for("  jvvnl "), "ATS63774")
+        self.assertEqual(mapping.cluster_head_for("Namma Yatri-Bengaluru"), "ATS77782")
+        self.assertIsNone(mapping.cluster_head_for("Adani"))
+        self.assertTrue(mapping.is_cluster_head("ats80558"))
+        self.assertFalse(mapping.is_cluster_head("l2user"))
+
+
+class ProcessAdminTests(DowntimeWorkflowTestCase):
+    """Processes are added, edited and taken off the upload page from the admin."""
+
+    CHANGELIST = "/admin/users/process/"
+    ADD = "/admin/users/process/add/"
+
+    def setUp(self):
+        super().setUp()
+        self.superuser = User.objects.create_superuser(
+            username="root", password="pw", email="root@iccs.in",
+        )
+        # A real process/location from the mapping file that is not seeded.
+        seeded = {n.lower() for n in Process.objects.values_list("name", flat=True)}
+        self.new_process = next(
+            p for p in mapping_processes() if p.lower() not in seeded
+        )
+        self.new_location = users_mapping.locations_for_process(self.new_process)[0]
+
+    def add(self, **overrides):
+        data = {
+            "name": self.new_process, "location": self.new_location,
+            "cluster_head_name": "New Head", "cluster_head_ats_id": " ats55555 ",
+            "is_active": "on",
+        }
+        data.update(overrides)
+        self.client.force_login(self.superuser)
+        return self.client.post(self.ADD, data)
+
+    def test_the_seed_matches_what_was_offered_before(self):
+        self.assertEqual(Process.objects.count(), 15)
+        self.assertEqual(users_mapping.cluster_head_for("JVVNL", "JAIPUR"), "ATS63774")
+        self.assertEqual(users_mapping.cluster_head_for("Emaar", "GURUGRAM"), "ATS80558")
+
+    def test_an_added_process_is_offered_and_routed(self):
+        response = self.add()
+        self.assertEqual(response.status_code, 302, response.content[:500])
+
+        row = Process.objects.get(name=self.new_process)
+        self.assertEqual(row.cluster_head_ats_id, "ATS55555")
+        self.assertIn(self.new_process, users_mapping.get_processes())
+        self.assertEqual(
+            users_mapping.get_process_location_map()[self.new_process],
+            [self.new_location],
+        )
+        self.assertEqual(
+            users_mapping.cluster_head_for(self.new_process, self.new_location),
+            "ATS55555",
+        )
+
+    def test_a_missing_l2_account_is_warned_about(self):
+        response = self.add()
+        self.client.force_login(self.superuser)
+        page = self.client.get(response["Location"])
+        self.assertContains(page, "No active L2 user has the username ATS55555")
+
+    def test_a_duplicate_is_refused_whatever_the_case(self):
+        self.add()
+        response = self.add(name=self.new_process, location=self.new_location.upper())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Process.objects.filter(name=self.new_process).count(), 1)
+
+    def test_a_location_the_process_does_not_run_at_is_refused(self):
+        wrong = next(
+            loc for loc in users_mapping.get_locations()
+            if loc not in users_mapping.locations_for_process(self.new_process)
+        )
+        response = self.add(location=wrong)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "is not a location of")
+        self.assertFalse(Process.objects.filter(name=self.new_process).exists())
+
+    def test_incomplete_or_malformed_entries_are_refused(self):
+        for overrides in (
+            {"cluster_head_name": "   "},
+            {"cluster_head_ats_id": "12345"},
+            {"name": ""},
+        ):
+            with self.subTest(overrides=overrides):
+                response = self.add(**overrides)
+                self.assertEqual(response.status_code, 200)
+        self.assertFalse(Process.objects.filter(name=self.new_process).exists())
+
+    def test_editing_changes_the_cluster_head(self):
+        row = Process.objects.get(name="JVVNL")
+        self.client.force_login(self.superuser)
+        self.client.post(f"{self.CHANGELIST}{row.pk}/change/", {
+            "name": row.name, "location": row.location,
+            "cluster_head_name": "Someone Else", "cluster_head_ats_id": "ATS11111",
+            "is_active": "on",
+        })
+        self.assertEqual(users_mapping.cluster_head_for("JVVNL", "JAIPUR"), "ATS11111")
+
+    def test_remove_asks_first_then_takes_it_off_the_dropdown_only(self):
+        row = Process.objects.get(name="JVVNL")
+        pending = UploadedFile.objects.create(
+            file="L1_approved/jvvnl.xlsx", uploaded_by=self.uploader,
+            process="JVVNL", location="JAIPUR", is_split=True, l1_status="unlock",
+        )
+        self.client.force_login(self.superuser)
+        payload = {"action": "remove_from_upload_page", "_selected_action": [row.pk]}
+
+        confirm = self.client.post(self.CHANGELIST, payload)
+        self.assertContains(confirm, "Yes, remove from the upload page")
+        row.refresh_from_db()
+        self.assertTrue(row.is_active, "nothing changes until confirmed")
+
+        self.client.post(self.CHANGELIST, {**payload, "post": "yes"})
+        row.refresh_from_db()
+        self.assertFalse(row.is_active)
+        self.assertNotIn("JVVNL", users_mapping.get_processes())
+        # The file and its routing are untouched.
+        self.assertTrue(UploadedFile.objects.filter(id=pending.id).exists())
+        self.assertEqual(users_mapping.cluster_head_for("JVVNL", "JAIPUR"), "ATS63774")
+
+    def test_add_back_returns_it_to_the_dropdown(self):
+        Process.objects.filter(name="JVVNL").update(is_active=False)
+        row = Process.objects.get(name="JVVNL")
+        self.client.force_login(self.superuser)
+        self.client.post(self.CHANGELIST, {
+            "action": "add_back_to_upload_page", "_selected_action": [row.pk],
+        })
+        self.assertIn("JVVNL", users_mapping.get_processes())
+
+    def test_rows_cannot_be_hard_deleted(self):
+        row = Process.objects.get(name="JVVNL")
+        self.client.force_login(self.superuser)
+        response = self.client.post(f"{self.CHANGELIST}{row.pk}/delete/", {"post": "yes"})
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(Process.objects.filter(pk=row.pk).exists())
+
+    def test_list_shows_the_columns_and_an_edit_button(self):
+        self.client.force_login(self.superuser)
+        page = self.client.get(self.CHANGELIST)
+        for heading in ("Process Name", "Location", "Cluster Head Name",
+                        "Cluster Head ATS ID", "Actions"):
+            self.assertContains(page, heading)
+        self.assertContains(page, ">Edit</a>")
+
+    def test_processes_sit_directly_below_users_in_the_sidebar(self):
+        self.client.force_login(self.superuser)
+        page = self.client.get("/admin/")
+        users_app = next(a for a in page.context["app_list"] if a["app_label"] == "users")
+        names = [m["object_name"] for m in users_app["models"]]
+        self.assertEqual(names[:2], ["User", "Process"])
+
+    def test_only_permitted_staff_can_manage_processes(self):
+        from django.contrib.auth.models import Permission
+
+        staff = User.objects.create_user(username="staff", password="pw", is_staff=True)
+        self.client.force_login(staff)
+        self.assertEqual(self.client.get(self.CHANGELIST).status_code, 403)
+
+        staff.user_permissions.add(*Permission.objects.filter(
+            codename__in=("view_process", "add_process", "change_process")
+        ))
+        self.assertEqual(self.client.get(self.CHANGELIST).status_code, 200)
+
+        self.client.force_login(self.uploader)
+        self.assertNotEqual(self.client.get(self.CHANGELIST).status_code, 200)
+
+
+def mapping_processes():
+    return users_mapping.get_mapping_processes()
+
+
 class AccessControlTests(DowntimeWorkflowTestCase):
     def test_l2_user_lands_on_l2_page_after_login(self):
         response = self.client.post(
@@ -2474,6 +2914,28 @@ class UploadNotificationEmailTests(DowntimeWorkflowTestCase):
         self.assertIn("sent for approval", text)
         self.assertNotIn("could not be sent", text)
         self.assertEqual(len(mail.outbox), 1)
+
+    def test_upload_mail_goes_to_the_processes_cluster_head(self):
+        from django.core import mail
+        from users import mapping
+
+        User.objects.create_user(
+            username=mapping.cluster_head_for(UPLOAD_PROCESS), password="pw",
+            role="l2", email="head@iccs.in",
+        )
+        self.upload_as(self.uploader)
+
+        to = mail.outbox[0].to
+        self.assertIn("head@iccs.in", to)
+        self.assertNotIn("akshat.bhatnagar@iccs.in", to)
+        self.assertIn("santosh.kumar@iccs.in", to)
+
+    def test_upload_mail_falls_back_when_the_cluster_head_has_no_email(self):
+        from django.core import mail
+
+        self.upload_as(self.uploader)
+
+        self.assertIn("akshat.bhatnagar@iccs.in", mail.outbox[0].to)
 
 @override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
 class AdminCreatedUserPasswordTests(TestCase):
